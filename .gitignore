@@ -1,0 +1,9 @@
+.build/
+build/
+out/
+.DS_Store
+*.xcodeproj
+.swiftpm/
+reference/
+.zcode/
+.video_agent/
