@@ -13,9 +13,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.delegate = self
-        popover.contentSize = NSSize(width: 320, height: 486)
-        popover.contentViewController = NSHostingController(
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentSize = NSSize(width: 320, height: 640)
+        // Drive the popover's size from SwiftUI layout changes (mode switch
+        // grows/shrinks the content); otherwise the content gets squeezed
+        // into the previous size with no way to see the rest.
+        let hostingController = NSHostingController(
             rootView: PopoverRootView().environmentObject(appState))
+        hostingController.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hostingController
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -55,11 +61,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - NSPopoverDelegate
 
-    func popoverWillShow(_ notification: Notification) {
+    @objc func popoverWillShow(_ notification: Notification) {
         appState.popoverWillShow()
     }
 
-    func popoverDidClose(_ notification: Notification) {
+    @objc func popoverDidClose(_ notification: Notification) {
         appState.popoverDidClose()
     }
 }

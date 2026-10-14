@@ -31,6 +31,13 @@ struct Favorite: Codable, Identifiable, Equatable {
 }
 
 /// Orchestrates the lamp connection, polling, optimistic UI state and favourites.
+///
+/// Connection model: one device op in flight at a time, extra polls coalesced
+/// into a single trailing request, writes re-queued if the lamp is unreachable,
+/// and network sweeps (rediscovery) throttled by `ReconnectPlanner` — the old
+/// design ran a full-subnet sweep per failure on the same serial queue as the
+/// commands, which wedged the app in "conectando…" forever whenever the lamp
+/// had a transient outage.
 @MainActor
 final class AppState: ObservableObject {
     enum ConnectionState: Equatable {
@@ -41,7 +48,9 @@ final class AppState: ObservableObject {
     }
 
     @Published var bulb: BulbState?
-    @Published var connection: ConnectionState = .unconfigured
+    @Published var connection: ConnectionState = .unconfigured {
+        didSet { Self.traceLog("state \(oldValue) -> \(connection)") }
+    }
     @Published var bulbKind: BulbModel.BulbKind = .typeB
     @Published var deviceName: String = "Lâmpada"
     @Published var favorites: [Favorite] = []
@@ -50,14 +59,27 @@ final class AppState: ObservableObject {
     @Published var lastError: String?
 
     private let worker = DispatchQueue(label: "openbulb.bulb-worker", qos: .userInitiated)
+    private let scanQueue = DispatchQueue(label: "openbulb.bulb-scan", qos: .utility)
     private var pollTimer: Timer?
     private var pendingDPS: [String: Any] = [:]
     private var flushWorkItem: DispatchWorkItem?
-    private var reconnectAttempt = 0
 
-    var isConfigured: Bool {
-        ConfigStore.load().isDeviceConfigured && ConfigStore.loadLocalKey() != nil
+    /// Cached device coordinates (loaded from ConfigStore once, not per op —
+    /// keychain reads on every poll used to run on the main thread).
+    private struct DeviceTarget {
+        var deviceId: String
+        var key: Data
+        var host: String
+        var version: Double
     }
+    private var target: DeviceTarget?
+
+    private var opInFlight = false
+    private var pollQueued = false
+    private var scanRunning = false
+    private var planner = ReconnectPlanner()
+
+    var isConfigured: Bool { target != nil }
 
     /// Shared instance: the AppDelegate status item, popover and the Settings
     /// scene all drive the same state.
@@ -65,14 +87,60 @@ final class AppState: ObservableObject {
 
     init() {
         loadFavorites()
-        let cfg = ConfigStore.load()
-        if cfg.isDeviceConfigured, ConfigStore.loadLocalKey() != nil {
-            deviceName = cfg.deviceName ?? "Lâmpada"
-            connection = .connecting
-        } else {
-            connection = .unconfigured
+        loadLastState()
+        connection = .connecting
+        if ProcessInfo.processInfo.environment["OPENBULB_TEST_POPOVER"] != nil {
+            // harness hook: simulate an open popover (5s poll cadence) in headless tests
+            popoverVisible = true
+        }
+        loadConfigAsync()
+        // if the keychain wedges (ACL prompt nobody can answer), degrade to an
+        // actionable offline state instead of spinning "conectando…" forever
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.target == nil else { return }
+            self.connection = .offline("não consegui ler a configuração (Keychain)")
         }
         startPolling()
+    }
+
+    /// Env-gated stderr tracing (OPENBULB_TRACE=1) — zero cost when off;
+    /// the standard way to watch the connection loop during LAN debugging.
+    static func traceLog(_ s: String) {
+        guard ProcessInfo.processInfo.environment["OPENBULB_TRACE"] != nil else { return }
+        let ms = Int(Date().timeIntervalSince1970 * 1000)
+        FileHandle.standardError.write("[openbulb] \(ms) \(s)\n".data(using: .utf8)!)
+    }
+
+    /// Load device coordinates off the main thread: the keychain read can
+    /// block indefinitely waiting for an ACL approval prompt a menu bar app
+    /// never shows — the old code did this on the main thread for every
+    /// single poll, freezing the popover ("travado em conectando").
+    private func loadConfigAsync(preferredName: String? = nil) {
+        worker.async { [weak self] in
+            let cfg = ConfigStore.load()
+            let keyStr = ConfigStore.loadLocalKey()
+            Self.traceLog("config.loaded id=\(cfg.deviceId != nil) key=\(keyStr != nil)")
+            Task { @MainActor in
+                self?.applyConfig(cfg, localKey: keyStr, preferredName: preferredName)
+            }
+        }
+    }
+
+    private func applyConfig(_ cfg: ConfigStore.AppConfig,
+                             localKey: String?, preferredName: String? = nil) {
+        guard let id = cfg.deviceId,
+              let keyStr = localKey,
+              let key = keyStr.data(using: .utf8) else {
+            target = nil
+            if case .online = connection {} else { connection = .unconfigured }
+            return
+        }
+        deviceName = preferredName ?? cfg.deviceName ?? "Lâmpada"
+        target = DeviceTarget(deviceId: id, key: key,
+                              host: cfg.ip ?? "", version: cfg.version ?? 3.3)
+        if connection != .online { connection = .connecting }
+        pollQueued = true
+        drainOps()
     }
 
     // MARK: - Polling
@@ -84,7 +152,7 @@ final class AppState: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if case .unconfigured = self.connection { return }
-                self.refresh()
+                self.pollNow()
                 self.startPolling() // reschedule at the current cadence
             }
         }
@@ -92,7 +160,7 @@ final class AppState: ObservableObject {
 
     func popoverWillShow() {
         popoverVisible = true
-        refresh()
+        pollNow()
         startPolling()
     }
 
@@ -103,23 +171,7 @@ final class AppState: ObservableObject {
 
     // MARK: - Device operations
 
-    func refresh() {
-        if case .unconfigured = connection { return }
-        run { device, _ in
-            let result = try device.status()
-            guard let dps = result["dps"] as? [String: Any] else {
-                throw TuyaDevice.DeviceError.payload("sem dps na resposta")
-            }
-            return dps
-        } onResult: { [weak self] dps, _ in
-            guard let self else { return }
-            if let kind = BulbModel.detectKind(dps: dps) { self.bulbKind = kind }
-            if let state = BulbModel.state(from: dps) {
-                self.bulb = state
-                self.lastError = nil
-            }
-        }
-    }
+    func refresh() { pollNow() }
 
     func setPower(_ on: Bool) {
         optimistically { $0.isOn = on }
@@ -167,27 +219,18 @@ final class AppState: ObservableObject {
         saveFavorites()
     }
 
-    /// Re-resolve the lamp's IP via UDP discovery (DHCP may have moved it).
+    /// Re-resolve the lamp's IP (DHCP may have moved it). Uses the active TCP
+    /// sweep + key-confirmed probe, like the wizard: the Elgin lamp (3.5)
+    /// never answers UDP broadcasts, so passive listening would never find it.
+    /// User-initiated: bypasses the sweep throttle.
     func rediscover() {
         connection = .connecting
-        let cfg = ConfigStore.load()
-        guard let id = cfg.deviceId else { return }
-        worker.async { [weak self] in
-            let found = TuyaDiscovery.findDevice(id: id, duration: 8)
-            Task { @MainActor in
-                guard let self else { return }
-                if let found {
-                    var cfg = ConfigStore.load()
-                    cfg.ip = found.ip
-                    cfg.version = Double(found.version) ?? cfg.version
-                    ConfigStore.save(cfg)
-                    self.connection = .connecting
-                    self.refresh()
-                } else {
-                    self.connection = .offline("lâmpada não encontrada na rede")
-                }
-            }
+        pollQueued = true
+        if target != nil {
+            startScan(userInitiated: true)
+            drainOps()
         }
+        // config still loading async — the first poll fires once it lands
     }
 
     /// After the wizard finishes configuring the device.
@@ -195,7 +238,7 @@ final class AppState: ObservableObject {
         deviceName = name
         connection = .connecting
         lastError = nil
-        refresh()
+        loadConfigAsync(preferredName: name)
         startPolling()
     }
 
@@ -207,6 +250,7 @@ final class AppState: ObservableObject {
         cfg.deviceName = nil
         ConfigStore.save(cfg)
         ConfigStore.saveLocalKey(nil)
+        target = nil
         bulb = nil
         connection = .unconfigured
     }
@@ -274,85 +318,164 @@ final class AppState: ObservableObject {
         var s = bulb ?? BulbState()
         mutate(&s)
         bulb = s
-        connection = .online
     }
 
     /// Queue DPS writes, coalescing rapid slider updates into one flush.
     private func sendDPS(_ dps: [String: Any]) {
         for (k, v) in dps { pendingDPS[k] = v }
         flushWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.flushPending() }
+        let item = DispatchWorkItem { [weak self] in self?.drainOps() }
         flushWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: item)
     }
 
-    private func flushPending() {
-        guard !pendingDPS.isEmpty else { return }
-        let dps = pendingDPS
-        pendingDPS = [:]
-        run { device, _ in
-            try device.setDPS(dps)
-            return ()
-        } onResult: { _, _ in }
+    /// Request a status poll; coalesced into a single trailing op while
+    /// another one is in flight.
+    func pollNow() {
+        guard target != nil else { return }
+        pollQueued = true
+        drainOps()
     }
 
-    /// Runs a blocking device operation on the worker queue and applies the
-    /// result on the main actor, translating errors into connection state.
-    private func run<T>(_ op: @escaping (TuyaDevice, BulbModel.BulbKind) throws -> T,
-                        onResult: @escaping (T, BulbModel.BulbKind) -> Void) {
-        let cfg = ConfigStore.load()
-        guard let deviceId = cfg.deviceId,
-              let keyStr = ConfigStore.loadLocalKey(),
-              let key = keyStr.data(using: .utf8) else {
-            connection = .unconfigured
+    /// The single lane onto the worker queue: at most one op in flight; a
+    /// pending write goes first, then one coalesced status poll.
+    private func drainOps() {
+        guard target != nil, !opInFlight else { return }
+        if !pendingDPS.isEmpty {
+            let dps = pendingDPS
+            pendingDPS = [:]
+            execute(label: "set", op: { try $0.setDPS(dps) }) { [weak self] success, error in
+                guard let self else { return }
+                if !success {
+                    // the command didn't make it — keep it queued so it fires
+                    // on the next successful connection instead of vanishing
+                    for (k, v) in dps { self.pendingDPS[k] = v }
+                }
+                self.opFinished(success: success, error: error)
+            }
             return
         }
-        let host = cfg.ip ?? ""
-        let version = cfg.version ?? 3.3
+        if pollQueued {
+            pollQueued = false
+            execute(label: "status", op: { try $0.status() }) { [weak self] success, error in
+                guard let self else { return }
+                if success { self.lastError = nil }
+                self.opFinished(success: success, error: error)
+            }
+        }
+    }
+
+    private func execute(label: String,
+                         op: @escaping (TuyaDevice) throws -> [String: Any]?,
+                         completion: @escaping (Bool, Error?) -> Void) {
+        guard let t = target else { return }
+        opInFlight = true
+        Self.traceLog("op.start \(label) host=\(t.host)")
         worker.async { [weak self] in
-            let device = TuyaDevice(config: .init(deviceID: deviceId, host: host,
-                                                  localKey: key, version: version,
+            let device = TuyaDevice(config: .init(deviceID: t.deviceId, host: t.host,
+                                                  localKey: t.key, version: t.version,
                                                   timeout: 5))
             do {
-                let result = try op(device, .typeB)
+                let result = try op(device)
+                Self.traceLog("op.ok \(label)")
                 Task { @MainActor in
-                    guard let self else { return }
-                    self.connection = .online
-                    self.reconnectAttempt = 0
-                    onResult(result, .typeB)
+                    self?.opInFlight = false
+                    self?.applyStatus(result)
+                    completion(true, nil)
                 }
             } catch {
+                Self.traceLog("op.err \(label) \(error)")
                 Task { @MainActor in
-                    guard let self else { return }
-                    self.handleDeviceError(error)
+                    self?.opInFlight = false
+                    completion(false, error)
                 }
             }
         }
     }
 
-    private func handleDeviceError(_ error: Error) {
-        // retry with rediscovery a couple of times before declaring offline
-        if reconnectAttempt < 2, isNetworkError(error) {
-            reconnectAttempt += 1
-            connection = .connecting
-            rediscover()
-            return
+    private func applyStatus(_ result: [String: Any]?) {
+        guard let dps = result?["dps"] as? [String: Any] else { return }
+        if let kind = BulbModel.detectKind(dps: dps) { bulbKind = kind }
+        if let state = BulbModel.state(from: dps) {
+            bulb = state
+            saveLastState(state)
         }
-        reconnectAttempt = 0
-        connection = .offline(String(describing: error))
-        lastError = String(describing: error)
     }
 
-    private func isNetworkError(_ error: Error) -> Bool {
-        let e = String(describing: error)
-        return e.contains("offline") || e.contains("connect") || e.contains("timed out")
-            || e.contains("timeout") || e.contains("No route") || e.contains("closed")
+    private func opFinished(success: Bool, error: Error?) {
+        if success {
+            planner.opSucceeded()
+            if connection != .online { connection = .online }
+        } else {
+            let sweep = planner.opFailed(now: Date().timeIntervalSinceReferenceDate)
+            lastError = error.map { String(describing: $0) }
+            if case .offline = connection {
+                // already declared offline by a sweep that found nothing —
+                // stay there quietly until a poll succeeds
+            } else {
+                connection = .connecting
+            }
+            if sweep { startScan(userInitiated: false) }
+        }
+        drainOps()
+    }
+
+    /// Network sweep for the lamp, on its own queue so it can never jam the
+    /// command lane. Throttled by the planner unless user-initiated.
+    private func startScan(userInitiated: Bool) {
+        guard !scanRunning, let t = target else { return }
+        if userInitiated {
+            planner.userScanRequested(now: Date().timeIntervalSinceReferenceDate)
+        }
+        scanRunning = true
+        Self.traceLog("scan.start")
+        scanQueue.async { [weak self] in
+            let found = TuyaDiscovery.activeScan(deviceID: t.deviceId, localKey: t.key)
+            Self.traceLog("scan.end found=\(found != nil)")
+            Task { @MainActor in
+                guard let self else { return }
+                self.scanRunning = false
+                if let found {
+                    var cfg = ConfigStore.load()
+                    cfg.ip = found.ip
+                    cfg.version = Double(found.version) ?? cfg.version
+                    ConfigStore.save(cfg)
+                    self.target?.host = found.ip
+                    if let v = Double(found.version) { self.target?.version = v }
+                    self.pollQueued = true
+                } else if self.target != nil {
+                    self.connection = .offline("lâmpada não encontrada na rede")
+                }
+                self.drainOps()
+            }
+        }
     }
 
     // MARK: - favorites persistence
 
     static var favoritesURL: URL {
         ConfigStore.directory.appendingPathComponent("favorites.json")
+    }
+
+    static var lastStateURL: URL {
+        ConfigStore.directory.appendingPathComponent("last-state.json")
+    }
+
+    /// Last observed lamp state, so the popover can show controls (with a
+    /// reconnect note) even before the first poll succeeds — or when the
+    /// keychain/config is slow to load.
+    func loadLastState() {
+        guard bulb == nil,
+              let data = try? Data(contentsOf: Self.lastStateURL),
+              let state = try? JSONDecoder().decode(BulbState.self, from: data) else { return }
+        bulb = state
+    }
+
+    func saveLastState(_ state: BulbState) {
+        try? FileManager.default.createDirectory(at: ConfigStore.directory, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(state) {
+            try? data.write(to: Self.lastStateURL, options: .atomic)
+        }
     }
 
     func loadFavorites() {

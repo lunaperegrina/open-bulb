@@ -21,6 +21,11 @@ public enum ConfigStore {
         public var deviceName: String?
         public var ip: String?
         public var version: Double?
+        /// Device local key, file-backed. The Keychain turned out to be a trap
+        /// here: the item's ACL only trusts the binary that created it, and an
+        /// ad-hoc re-sign on every rebuild makes reads block forever on an
+        /// approval prompt a menu bar app can't show.
+        public var localKey: String?
 
         public init() {}
 
@@ -86,14 +91,38 @@ public enum ConfigStore {
     public static let localKeyAccount = "device-local-key"
     public static let apiSecretAccount = "tuya-api-secret"
 
-    /// Local key resolved from Keychain, falling back to the config file.
+    /// Local key resolution order: env override (harness), config file,
+    /// Keychain (legacy migration path — may block on old installs, so it is
+    /// only consulted last and off the main thread).
     public static func loadLocalKey(config: AppConfig = ConfigStore.load()) -> String? {
-        if let key = keychainGet(localKeyAccount), !key.isEmpty { return key }
+        if let k = ProcessInfo.processInfo.environment["OPENBULB_LOCAL_KEY"],
+           k.count == 16 { return k }
+        if let k = config.localKey, k.count == 16 { return k }
+        if let key = keychainGet(localKeyAccount), !key.isEmpty {
+            migrateKeychainKeyToFile(key, config: config)
+            return key
+        }
         return nil
     }
 
+    /// Once we manage to read the legacy Keychain copy, persist it to the
+    /// config file so the app never needs the Keychain again.
+    private static func migrateKeychainKeyToFile(_ key: String, config: AppConfig) {
+        var cfg = config
+        cfg.localKey = key
+        save(cfg)
+    }
+
     public static func saveLocalKey(_ key: String?) {
-        keychainSet(key, account: localKeyAccount)
+        // File is the source of truth; the Keychain copy is best-effort and
+        // async (SecItemAdd/Update can also block on an ACL prompt).
+        var cfg = load()
+        cfg.localKey = key
+        save(cfg)
+        let queryAccount = localKeyAccount
+        DispatchQueue.global(qos: .utility).async {
+            keychainSet(key, account: queryAccount)
+        }
     }
 
     public static func loadAPISecret(config: AppConfig = ConfigStore.load()) -> String? {

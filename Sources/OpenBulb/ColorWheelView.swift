@@ -7,6 +7,8 @@ struct ColorWheelView: View {
     @Binding var hue: Double
     @Binding var saturation: Double
     @Binding var value: Double
+    /// When false (lamp off) glows are suppressed and the control dims.
+    var lit = true
 
     @State private var isDragging = false
 
@@ -20,20 +22,24 @@ struct ColorWheelView: View {
                 ZStack {
                     ColorWheelImage(side: side)
                         .clipShape(Circle())
-                        .overlay(Circle().strokeBorder(Color.primary.opacity(0.1), lineWidth: 1))
+                        .overlay(Circle().strokeBorder(Theme.hairline, lineWidth: 1))
+                        .shadow(color: currentColor.opacity(lit ? 0.4 : 0), radius: 14)
+                        .opacity(lit ? 1 : 0.55)
                     // knob
                     let knobPos = knobCenter(center: center, radius: radius)
                     Circle()
                         .fill(Color.white)
-                        .frame(width: 22, height: 22)
-                        .shadow(radius: 2)
+                        .frame(width: 24, height: 24)
+                        .shadow(color: currentColor.opacity(lit ? 0.55 : 0), radius: 5)
                         .overlay(Circle().strokeBorder(Color.black.opacity(0.15), lineWidth: 1))
                         .overlay(
                             Circle()
                                 .fill(currentColor)
-                                .frame(width: 14, height: 14)
+                                .frame(width: 15, height: 15)
                         )
                         .position(knobPos)
+                        .animation(.easeOut(duration: 0.12), value: saturation)
+                        .animation(.easeOut(duration: 0.12), value: hue)
                 }
                 .contentShape(Rectangle())
                 .gesture(
@@ -46,28 +52,41 @@ struct ColorWheelView: View {
                 )
             }
             .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Roda de cores")
+            .accessibilityValue(ColorNames.name(hue: hue))
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: hue = (hue + 15).truncatingRemainder(dividingBy: 360)
+                case .decrement: hue = (hue - 15 + 360).truncatingRemainder(dividingBy: 360)
+                @unknown default: break
+                }
+            }
 
             // brightness of the colour
-            VStack(spacing: 6) {
+            VStack(spacing: 8) {
                 Image(systemName: "sun.max")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textSecondary)
                 GeometryReader { geo in
                     ZStack(alignment: .bottom) {
                         Capsule()
                             .fill(LinearGradient(
                                 stops: [
-                                    .init(color: .black.opacity(0.5), location: 0),
+                                    .init(color: Color.black.opacity(0.45), location: 0),
                                     .init(color: currentColor, location: 1),
                                 ],
                                 startPoint: .bottom, endPoint: .top))
-                            .frame(width: 12)
+                            .frame(width: 14)
+                            .overlay(Capsule().strokeBorder(Theme.hairline, lineWidth: 1))
                             .offset(x: -2)
                         Circle()
                             .fill(Color.white)
-                            .shadow(radius: 1)
-                            .frame(width: 14, height: 14)
-                            .position(x: 4, y: (1 - value) * geo.size.height)
+                            .shadow(color: currentColor.opacity(lit ? 0.5 : 0), radius: 4)
+                            .overlay(Circle().strokeBorder(Color.black.opacity(0.15), lineWidth: 1))
+                            .frame(width: 16, height: 16)
+                            .position(x: 5, y: (1 - value) * geo.size.height)
+                            .animation(.easeOut(duration: 0.12), value: value)
                     }
                     .contentShape(Rectangle())
                     .gesture(
@@ -77,9 +96,19 @@ struct ColorWheelView: View {
                     )
                 }
                 .frame(width: 20)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Intensidade da cor")
+                .accessibilityValue("\(Int(round(value * 100))) por cento")
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment: value = min(value + 0.05, 1)
+                    case .decrement: value = max(value - 0.05, 0)
+                    @unknown default: break
+                    }
+                }
                 Text("\(Int(round(value * 100)))")
-                    .font(.system(size: 9).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(Theme.textSecondary)
             }
         }
     }
